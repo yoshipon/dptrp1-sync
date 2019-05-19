@@ -150,3 +150,5 @@ for d, dp_info in dict( (dp_relpath(i['entry_path']), i) for i in dp.list_docume
 
 with open(os.path.join(config.sync_path, '.revisions'), 'w') as f:
    json.dump(lo_revmd5s, f)
+
+print('Synchronization done')

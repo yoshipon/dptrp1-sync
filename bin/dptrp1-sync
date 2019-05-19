@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+
+import os
+import yaml
+import json
+from argparse import ArgumentParser
+import hashlib
+
+from dptrp1.dptrp1 import DigitalPaper
+
+
+dp_root = 'Document'
+
+# load user configuration
+try:
+   with open(os.path.expanduser('~/.dptrp1rc'), 'r') as f:
+      config = yaml.load(f)
+except:
+   config = dict()
+
+# parse commandline arguments
+parser = ArgumentParser()
+
+path = lambda x: os.path.expandvars(os.path.expanduser(x))
+parser.add_argument('--sync_path', type=path, default=config.get('sync_path', './Document'))
+parser.add_argument('--client_id', type=path, default=config.get('client_id', 'deviceid.dat'))
+parser.add_argument('--key'      , type=path, default=config.get('key'      , 'privatekey.dat'))
+parser.add_argument('--hostname' , default=config.get('hostname' , 'digitalpaper.local'))
+
+config = parser.parse_args()
+
+for key, val in vars(config).items():
+    print(f'{key:9s}: {val}')
+print()
+
+def dp_relpath(x):
+   return os.path.relpath(x, dp_root)
+
+def get_lo_md5(d):
+   with open(os.path.join(config.sync_path, d), 'rb') as f:
+      data = f.read()
+
+   return hashlib.md5(data).hexdigest()
+
+def download(d, dp):
+   lo_doc = os.path.join(config.sync_path, d)
+   os.makedirs(os.path.dirname(lo_doc), exist_ok=True)
+   
+   data = dp.download(os.path.join(dp_root, d))
+   
+   with open(lo_doc, 'wb') as f:
+      f.write(data)
+
+def new_folders(f, dp_folders, dp):
+   if f in ['', '.', './']:
+      return
+
+   if f not in dp_folders:
+      new_folders(os.path.dirname(f), dp_folders, dp)
+
+      raw_path = os.path.join('Document', f)
+      
+      dp.new_folder(raw_path)
+      dp_folders.add(raw_path)
+   
+def upload(d, dp):   
+   with open(os.path.join(config.sync_path, d), 'rb') as f:
+      dp.upload(f, os.path.join(dp_root, d))
+
+def delete(d, dp):
+   dp.delete_document(os.path.join(dp_root, d))
+
+# test connection to remote
+print(f'Connection to \'{config.hostname}\': ', end='', flush=True)
+if os.system(f'ping -c 1 {config.hostname} > /dev/null 2>&1') == 0:
+   print('OK')
+else:
+   print('NG')
+   raise Exception(f'Failed to communicate with {config.hostname}')
+print()
+
+# authenticate
+with open(config.client_id) as f:
+   client_id = f.readline().strip()
+
+with open(config.key, 'rb') as f:
+   key = f.read()
+   
+dp = DigitalPaper(addr=config.hostname)
+dp.authenticate(client_id, key)
+
+# load remote status
+dp_docs = dict( (dp_relpath(i['entry_path']), i['file_revision']) for i in dp.list_documents() )
+dp_folders = set( dp_relpath(i['entry_path']) for i in dp.list_all() if i['entry_type'] == 'folder' )
+
+# load local status
+lo_docs = set()
+for root, dirs, files in os.walk(config.sync_path):
+   lo_relpath = lambda f: os.path.relpath(os.path.join(root, f), config.sync_path)
+   lo_docs |= set( lo_relpath(f) for f in files if f.endswith('.pdf') and f != '.revisions')
+   
+try:
+   with open(os.path.join(config.sync_path, '.revisions'), 'r') as f:
+      prev_revmd5s = json.load(f)
+except:
+   prev_revmd5s = dict()
+
+# download created files
+for d in set(dp_docs) - lo_docs:
+   print(f'Download {d}')
+   download(d, dp)
+   
+# upload
+for d in lo_docs - set(dp_docs):
+   print(f'Upload {d}')
+   
+   new_folders(os.path.dirname(d), dp_folders, dp)
+   upload(d, dp)
+
+conflict_docs = []
+for d in set(dp_docs) & lo_docs:
+   prev_revmd5 = prev_revmd5s.get(d, dict(dp_rev=None, lo_md5=None))
+
+   dp_rev = dp_docs[d]
+   lo_md5 = get_lo_md5(d)
+
+   dp_isnew = dp_rev != prev_revmd5['dp_rev']
+   lo_isnew = lo_md5 != prev_revmd5['lo_md5']
+
+   if dp_isnew & lo_isnew:
+      print(f'Warning: Revision conflict with {d}')
+      conflict_docs.append(d)
+      
+   elif dp_isnew:
+      print(f'Overwrite (remote->local) {d}')
+      download(d, dp)
+
+   elif lo_isnew:
+      print(f'Overwrite (local->remote) {d}')
+      delete(d, dp)
+      upload(d, dp)
+
+# create local revision file
+lo_revmd5s = dict()
+for d, dp_info in dict( (dp_relpath(i['entry_path']), i) for i in dp.list_documents() ).items():
+   if d in conflict_docs:
+      continue
+   
+   lo_revmd5s[d] = dict(dp_rev=dp_info['file_revision'], lo_md5=get_lo_md5(d))
+
+with open(os.path.join(config.sync_path, '.revisions'), 'w') as f:
+   json.dump(lo_revmd5s, f)
+
+exit()
